@@ -1,0 +1,250 @@
+#!/usr/bin/python3
+
+# Tim Thomas 2018
+# Ver 0.0.1
+
+import argparse
+import json
+import http.client
+#import urllib
+import sys
+from pprint import pprint
+
+# disable ssl cert verfiy
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
+
+parser = argparse.ArgumentParser(
+        description='Script to deploy iApp for NAT repros to PD')
+
+parser.add_argument('-l',
+                    '--list',
+                    action="store_true",
+                    default=False,
+                    help='list currently deployed nats')
+
+parser.add_argument('-d',
+                    '--debug',
+                    action="store_true",
+                    default=False,
+                    help='enable debug')
+
+parser.add_argument('-a',
+                    '--address',
+                    action="store",
+                    dest="address",
+                    default='10.154.164.129',
+                    help='IP address of BIG-IP use as NAT machine')
+
+parser.add_argument('-u',
+                    '--username',
+                    action="store",
+                    dest="username",
+                    default='admin',
+                    help='username for auth to BIG-IP')
+
+parser.add_argument('-p',
+                    '--password',
+                    action="store",
+                    dest="password",
+                    default='admin',
+                    help='password for auth to BIG-IP')
+
+parser.add_argument('-c',
+                    '--create',
+                    action="store",
+                    dest="create",
+                    help='Create and deploy nat Iapp, take name as arg and \
+                            requires --nat and --managmenet-ip')
+
+parser.add_argument('-n',
+                    '--nat',
+                    action="store",
+                    dest="nat",
+                    help='External NAT ip for iApp, required if -c given')
+
+parser.add_argument('-m',
+                    '--mgmt',
+                    action="store",
+                    dest="mgmt",
+                    help='Management-ip of BIG-IP setting up NAT for, \
+                            required if -c given')
+parser.add_argument('-r',
+                    '--remove',
+                    action="store",
+                    dest="remove",
+                    help='Takes name of deployed Service and deletes it from \
+                            BIG-IP')
+
+
+opt = parser.parse_args()
+
+# put check for -n and -m if -c is given
+if opt.create and opt.nat is None and opt.mgmt is None:
+    parser.error("--create requires --nat and --mgmt")
+
+if opt.debug is True:
+    print(opt)
+
+
+def get(address, url, auth_token):
+    headers = {'Content-type': 'application/json',
+               'X-F5-Auth-Token': auth_token}
+    try:
+        connection = http.client.HTTPSConnection(address)
+        connection.request('GET', url, headers=headers)
+    except ConnectionError:
+        print('ConnectionError')
+        sys.exit(0)
+    except:
+        raise
+        sys.exit(0)
+    r1 = connection.getresponse()
+    data1 = r1.read()
+    return data1.decode("utf-8")
+
+
+def delete(address, url, auth_token):
+    headers = {'Content-type': 'application/json',
+               'X-F5-Auth-Token': auth_token}
+    try:
+        connection = http.client.HTTPSConnection(address)
+        connection.request('DELETE', url, headers=headers)
+    except ConnectionError:
+        print('ConnectionError')
+        sys.exit(0)
+    except:
+        raise
+        sys.exit(0)
+    r1 = connection.getresponse()
+    data1 = r1.read()
+    return data1.decode("utf-8")
+
+
+def get_auth_token(username, password, address):
+    headers = {'Content-type': 'application/json'}
+    post_dict = {"username": username,
+                 "password": password,
+                 "loginProviderName": "tmos"}
+    post_json = json.dumps(post_dict)
+    try:
+        connection = http.client.HTTPSConnection(opt.address)
+        connection.request(
+                'POST',
+                '/mgmt/shared/authn/login',
+                post_json,
+                headers=headers)
+    except ConnectionError:
+        print('ConnectionError')
+        sys.exit(0)
+    except:
+        raise
+        sys.exit(0)
+    r1 = connection.getresponse()
+    data1 = r1.read()
+    data_dict = json.loads(data1.decode("utf-8"))
+    token = data_dict['token']['token']
+    return token
+
+
+def list_deployed():
+    url = '/mgmt/tm/sys/application/service/?$select=name,variables'
+    deployed_apps = get(opt.address, url, auth_token)
+    deployed_dict = dict(json.loads(deployed_apps))
+    bigip_dict = {}
+    try:
+        for i in deployed_dict['items']:
+            bigip_dict.update({i['name']:
+                              {'mgmt': i['variables'][0]['value'],
+                              'nat': i['variables'][1]['value']}})
+        # create a list of tuples from bigip_dict sorted by nat address:
+        curr_apps_sorted_list = sorted(
+                                        bigip_dict.items(),
+                                        key=lambda elem: elem[1]['nat']
+                                        )
+        # print headers
+        c1 = max(len(x) for x in bigip_dict)
+        print("{:<{width}}\t{:15}\t{}".format(
+              'NAME',
+              'NAT IP',
+              'Management-IP',
+              width=c1)
+              )
+        print("-" * 61)
+        # format results
+        for i in curr_apps_sorted_list:
+            print("{:<{width}}\t{}\t{}".format(
+                  i[0],
+                  i[1]['nat'],
+                  i[1]['mgmt'],
+                  width=c1))
+    except KeyError:
+        print("No Services Deployed")
+    except:
+        raise
+
+
+def post(address, url, auth_token, post_data):
+    headers = {'Content-type': 'application/json',
+               'X-F5-Auth-Token': auth_token}
+    post_json = json.dumps(post_data)
+    try:
+        connection = http.client.HTTPSConnection(address)
+        connection.request('POST', url, post_json, headers)
+    except ConnectionError:
+        print('ConnectionError')
+        sys.exit(0)
+    except:
+        raise
+        sys.exit(0)
+    r1 = connection.getresponse()
+    if opt.debug:
+        print(r1.status)
+        print(r1.reason)
+    if r1.status != 200:
+        print(r1.status)
+        print(r1.reason)
+        sys.exit(1)
+    data1 = r1.read()
+    return data1.decode("utf-8")
+
+
+def deploy_service():
+    iapp_val = {
+        "name": opt.create,
+        "template": "aaa_labnat_v1.0.0",
+        "vars": {
+            "LabNat__DevMgmt": opt.mgmt,
+            "LabNat__NatIp": opt.nat
+            }
+        }
+    url = '/mgmt/tm/cloud/services/iapp/'
+    post(opt.address, url, auth_token, iapp_val)
+
+
+def delete_service(name):
+    url = '/mgmt/tm/cloud/services/iapp/' + name
+    delete(opt.address, url, auth_token)
+
+
+# get auth_token, need thisd for every operation
+auth_token = get_auth_token(opt.username, opt.password, opt.address)
+
+
+# list
+if opt.list is True:
+    print("\n")
+    list_deployed()
+    print("\nAllowed address range 10.154.164.131-142")
+
+
+# deploy
+if opt.create:
+    deploy_service()
+    list_deployed()
+
+
+# delete service
+if opt.remove:
+    delete_service(opt.remove)
+    list_deployed()
